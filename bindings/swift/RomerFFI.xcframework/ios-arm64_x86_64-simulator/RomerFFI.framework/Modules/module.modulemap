@@ -1,0 +1,6 @@
+framework module RomerFFI {
+  umbrella header "RomerFFI-umbrella.h"
+
+  export *
+  module * { export * }
+}
