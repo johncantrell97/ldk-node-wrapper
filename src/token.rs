@@ -16,10 +16,10 @@ pub(crate) fn network_from_token(token: &str) -> Result<Network, Error> {
 	}
 
 	match token.chars().next() {
-		Some('r') => Ok(Network::Regtest),
-		Some('t') => Ok(Network::Testnet),
-		Some('s') => Ok(Network::Signet),
-		Some('m') => Ok(Network::Bitcoin),
+		Some('R') => Ok(Network::Regtest),
+		Some('T') => Ok(Network::Testnet),
+		Some('S') => Ok(Network::Signet),
+		Some('M') => Ok(Network::Bitcoin),
 		_ => Err(Error::InvalidAPIToken),
 	}
 }
@@ -35,26 +35,26 @@ mod test {
 
 	#[test]
 	fn regtest_token() {
-		assert_eq!(network_from_token("rsometoken"), Ok(Network::Regtest));
+		assert_eq!(network_from_token("Rsometoken"), Ok(Network::Regtest));
 	}
 
 	#[test]
 	fn testnet_token() {
-		assert_eq!(network_from_token("tsometoken"), Ok(Network::Testnet));
+		assert_eq!(network_from_token("Tsometoken"), Ok(Network::Testnet));
 	}
 
 	#[test]
 	fn signet_token() {
-		assert_eq!(network_from_token("ssometoken"), Ok(Network::Signet));
+		assert_eq!(network_from_token("Ssometoken"), Ok(Network::Signet));
 	}
 
 	#[test]
 	fn mainnet_token() {
-		assert_eq!(network_from_token("msometoken"), Ok(Network::Bitcoin));
+		assert_eq!(network_from_token("Msometoken"), Ok(Network::Bitcoin));
 	}
 
 	#[test]
 	fn invalid_token() {
-		assert_eq!(network_from_token("gsometoken"), Err(Error::InvalidAPIToken));
+		assert_eq!(network_from_token("Gsometoken"), Err(Error::InvalidAPIToken));
 	}
 }

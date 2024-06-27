@@ -3,8 +3,8 @@
 
 import PackageDescription
 
-let tag = "v0.1.0"
-let checksum = "f1221a4649ac40c2a2655f36258c37250ac2181c906fef6dc447b2e6f7936a4c"
+let tag = "v0.1.1"
+let checksum = "41512b0b24da4e3cc47e6447760e92af5f6ef25d8a17f1394a40bb25583f1823"
 let url = "https://github.com/johncantrell97/ldk-node-wrapper/releases/download/\(tag)/RomerFFI.xcframework.zip"
 
 let package = Package(
