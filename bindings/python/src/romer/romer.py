@@ -15,6 +15,7 @@
 # compile the rust component. The easiest way to ensure this is to bundle the Python
 # helpers directly inline like we're doing here.
 
+from __future__ import annotations
 import os
 import sys
 import ctypes
@@ -22,30 +23,37 @@ import enum
 import struct
 import contextlib
 import datetime
+import threading
+import itertools
+import traceback
 import typing
 import platform
 
 # Used for default argument values
-_DEFAULT = object()
+_DEFAULT = object() # type: typing.Any
 
 
 class _UniffiRustBuffer(ctypes.Structure):
     _fields_ = [
-        ("capacity", ctypes.c_int32),
-        ("len", ctypes.c_int32),
+        ("capacity", ctypes.c_uint64),
+        ("len", ctypes.c_uint64),
         ("data", ctypes.POINTER(ctypes.c_char)),
     ]
 
     @staticmethod
+    def default():
+        return _UniffiRustBuffer(0, 0, None)
+
+    @staticmethod
     def alloc(size):
-        return _rust_call(_UniffiLib.ffi_romer_rustbuffer_alloc, size)
+        return _uniffi_rust_call(_UniffiLib.ffi_romer_rustbuffer_alloc, size)
 
     @staticmethod
     def reserve(rbuf, additional):
-        return _rust_call(_UniffiLib.ffi_romer_rustbuffer_reserve, rbuf, additional)
+        return _uniffi_rust_call(_UniffiLib.ffi_romer_rustbuffer_reserve, rbuf, additional)
 
     def free(self):
-        return _rust_call(_UniffiLib.ffi_romer_rustbuffer_free, self)
+        return _uniffi_rust_call(_UniffiLib.ffi_romer_rustbuffer_free, self)
 
     def __str__(self):
         return "_UniffiRustBuffer(capacity={}, len={}, data={})".format(
@@ -167,9 +175,6 @@ class _UniffiRustBufferStream:
     def read_double(self):
         return self._unpack_from(8, ">d")
 
-    def read_c_size_t(self):
-        return self._unpack_from(ctypes.sizeof(ctypes.c_size_t) , "@N")
-
 class _UniffiRustBufferBuilder:
     """
     Helper for structured writing of bytes into a _UniffiRustBuffer.
@@ -257,28 +262,32 @@ class _UniffiRustCallStatus(ctypes.Structure):
     # These match the values from the uniffi::rustcalls module
     CALL_SUCCESS = 0
     CALL_ERROR = 1
-    CALL_PANIC = 2
+    CALL_UNEXPECTED_ERROR = 2
+
+    @staticmethod
+    def default():
+        return _UniffiRustCallStatus(code=_UniffiRustCallStatus.CALL_SUCCESS, error_buf=_UniffiRustBuffer.default())
 
     def __str__(self):
         if self.code == _UniffiRustCallStatus.CALL_SUCCESS:
             return "_UniffiRustCallStatus(CALL_SUCCESS)"
         elif self.code == _UniffiRustCallStatus.CALL_ERROR:
             return "_UniffiRustCallStatus(CALL_ERROR)"
-        elif self.code == _UniffiRustCallStatus.CALL_PANIC:
-            return "_UniffiRustCallStatus(CALL_PANIC)"
+        elif self.code == _UniffiRustCallStatus.CALL_UNEXPECTED_ERROR:
+            return "_UniffiRustCallStatus(CALL_UNEXPECTED_ERROR)"
         else:
             return "_UniffiRustCallStatus(<invalid code>)"
 
-def _rust_call(fn, *args):
+def _uniffi_rust_call(fn, *args):
     # Call a rust function
-    return _rust_call_with_error(None, fn, *args)
+    return _uniffi_rust_call_with_error(None, fn, *args)
 
-def _rust_call_with_error(error_ffi_converter, fn, *args):
+def _uniffi_rust_call_with_error(error_ffi_converter, fn, *args):
     # Call a rust function and handle any errors
     #
     # This function is used for rust calls that return Result<> and therefore can set the CALL_ERROR status code.
     # error_ffi_converter must be set to the _UniffiConverter for the error class that corresponds to the result.
-    call_status = _UniffiRustCallStatus(code=_UniffiRustCallStatus.CALL_SUCCESS, error_buf=_UniffiRustBuffer(0, 0, None))
+    call_status = _UniffiRustCallStatus.default()
 
     args_with_error = args + (ctypes.byref(call_status),)
     result = fn(*args_with_error)
@@ -291,10 +300,10 @@ def _uniffi_check_call_status(error_ffi_converter, call_status):
     elif call_status.code == _UniffiRustCallStatus.CALL_ERROR:
         if error_ffi_converter is None:
             call_status.error_buf.free()
-            raise InternalError("_rust_call_with_error: CALL_ERROR, but error_ffi_converter is None")
+            raise InternalError("_uniffi_rust_call_with_error: CALL_ERROR, but error_ffi_converter is None")
         else:
             raise error_ffi_converter.lift(call_status.error_buf)
-    elif call_status.code == _UniffiRustCallStatus.CALL_PANIC:
+    elif call_status.code == _UniffiRustCallStatus.CALL_UNEXPECTED_ERROR:
         # When the rust code sees a panic, it tries to construct a _UniffiRustBuffer
         # with the message.  But if that code panics, then it just sends back
         # an empty buffer.
@@ -307,86 +316,62 @@ def _uniffi_check_call_status(error_ffi_converter, call_status):
         raise InternalError("Invalid _UniffiRustCallStatus code: {}".format(
             call_status.code))
 
-# A function pointer for a callback as defined by UniFFI.
-# Rust definition `fn(handle: u64, method: u32, args: _UniffiRustBuffer, buf_ptr: *mut _UniffiRustBuffer) -> int`
-_UNIFFI_FOREIGN_CALLBACK_T = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char), ctypes.c_int, ctypes.POINTER(_UniffiRustBuffer))
+def _uniffi_trait_interface_call(call_status, make_call, write_return_value):
+    try:
+        return write_return_value(make_call())
+    except Exception as e:
+        call_status.code = _UniffiRustCallStatus.CALL_UNEXPECTED_ERROR
+        call_status.error_buf = _UniffiConverterString.lower(repr(e))
 
-# UniFFI future continuation
-_UNIFFI_FUTURE_CONTINUATION_T = ctypes.CFUNCTYPE(None, ctypes.c_size_t, ctypes.c_int8)
-class _UniffiPointerManagerCPython:
+def _uniffi_trait_interface_call_with_error(call_status, make_call, write_return_value, error_type, lower_error):
+    try:
+        try:
+            return write_return_value(make_call())
+        except error_type as e:
+            call_status.code = _UniffiRustCallStatus.CALL_ERROR
+            call_status.error_buf = lower_error(e)
+    except Exception as e:
+        call_status.code = _UniffiRustCallStatus.CALL_UNEXPECTED_ERROR
+        call_status.error_buf = _UniffiConverterString.lower(repr(e))
+class _UniffiHandleMap:
     """
-    Manage giving out pointers to Python objects on CPython
-
-    This class is used to generate opaque pointers that reference Python objects to pass to Rust.
-    It assumes a CPython platform.  See _UniffiPointerManagerGeneral for the alternative.
-    """
-
-    def new_pointer(self, obj):
-        """
-        Get a pointer for an object as a ctypes.c_size_t instance
-
-        Each call to new_pointer() must be balanced with exactly one call to release_pointer()
-
-        This returns a ctypes.c_size_t.  This is always the same size as a pointer and can be
-        interchanged with pointers for FFI function arguments and return values.
-        """
-        # IncRef the object since we're going to pass a pointer to Rust
-        ctypes.pythonapi.Py_IncRef(ctypes.py_object(obj))
-        # id() is the object address on CPython
-        # (https://docs.python.org/3/library/functions.html#id)
-        return id(obj)
-
-    def release_pointer(self, address):
-        py_obj = ctypes.cast(address, ctypes.py_object)
-        obj = py_obj.value
-        ctypes.pythonapi.Py_DecRef(py_obj)
-        return obj
-
-    def lookup(self, address):
-        return ctypes.cast(address, ctypes.py_object).value
-
-class _UniffiPointerManagerGeneral:
-    """
-    Manage giving out pointers to Python objects on non-CPython platforms
-
-    This has the same API as _UniffiPointerManagerCPython, but doesn't assume we're running on
-    CPython and is slightly slower.
-
-    Instead of using real pointers, it maps integer values to objects and returns the keys as
-    c_size_t values.
+    A map where inserting, getting and removing data is synchronized with a lock.
     """
 
     def __init__(self):
-        self._map = {}
+        # type Handle = int
+        self._map = {}  # type: Dict[Handle, Any]
         self._lock = threading.Lock()
-        self._current_handle = 0
+        self._counter = itertools.count()
 
-    def new_pointer(self, obj):
+    def insert(self, obj):
         with self._lock:
-            handle = self._current_handle
-            self._current_handle += 1
+            handle = next(self._counter)
             self._map[handle] = obj
-        return handle
+            return handle
 
-    def release_pointer(self, handle):
-        with self._lock:
-            return self._map.pop(handle)
+    def get(self, handle):
+        try:
+            with self._lock:
+                return self._map[handle]
+        except KeyError:
+            raise InternalError("_UniffiHandleMap.get: Invalid handle")
 
-    def lookup(self, handle):
-        with self._lock:
-            return self._map[handle]
+    def remove(self, handle):
+        try:
+            with self._lock:
+                return self._map.pop(handle)
+        except KeyError:
+            raise InternalError("_UniffiHandleMap.remove: Invalid handle")
 
-# Pick an pointer manager implementation based on the platform
-if platform.python_implementation() == 'CPython':
-    _UniffiPointerManager = _UniffiPointerManagerCPython # type: ignore
-else:
-    _UniffiPointerManager = _UniffiPointerManagerGeneral # type: ignore
+    def __len__(self):
+        return len(self._map)
 # Types conforming to `_UniffiConverterPrimitive` pass themselves directly over the FFI.
 class _UniffiConverterPrimitive:
     @classmethod
     def lift(cls, value):
         return value
- 
+
     @classmethod
     def lower(cls, value):
         return value
@@ -439,7 +424,7 @@ def _uniffi_future_callback_t(return_type):
     """
     Factory function to create callback function types for async functions
     """
-    return ctypes.CFUNCTYPE(None, ctypes.c_size_t, return_type, _UniffiRustCallStatus)
+    return ctypes.CFUNCTYPE(None, ctypes.c_uint64, return_type, _UniffiRustCallStatus)
 
 def _uniffi_load_indirect():
     """
@@ -468,7 +453,7 @@ def _uniffi_load_indirect():
 
 def _uniffi_check_contract_api_version(lib):
     # Get the bindings contract version from our ComponentInterface
-    bindings_contract_version = 25
+    bindings_contract_version = 26
     # Get the scaffolding contract version by calling the into the dylib
     scaffolding_contract_version = lib.ffi_romer_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version:
@@ -489,13 +474,114 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_romer_checksum_method_romer_status() != 30640:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_romer_checksum_constructor_romer_new() != 36083:
+    if lib.uniffi_romer_checksum_constructor_romer_new() != 43794:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
 # This is an implementation detail which will be called internally by the public API.
 
 _UniffiLib = _uniffi_load_indirect()
+_UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,ctypes.c_int8,
+)
+_UNIFFI_FOREIGN_FUTURE_FREE = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
+)
+_UNIFFI_CALLBACK_INTERFACE_FREE = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
+)
+class _UniffiForeignFuture(ctypes.Structure):
+    _fields_ = [
+        ("handle", ctypes.c_uint64),
+        ("free", _UNIFFI_FOREIGN_FUTURE_FREE),
+    ]
+class _UniffiForeignFutureStructU8(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_uint8),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_U8 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructU8,
+)
+class _UniffiForeignFutureStructI8(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_int8),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_I8 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructI8,
+)
+class _UniffiForeignFutureStructU16(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_uint16),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_U16 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructU16,
+)
+class _UniffiForeignFutureStructI16(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_int16),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_I16 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructI16,
+)
+class _UniffiForeignFutureStructU32(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_uint32),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_U32 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructU32,
+)
+class _UniffiForeignFutureStructI32(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_int32),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_I32 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructI32,
+)
+class _UniffiForeignFutureStructU64(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_uint64),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_U64 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructU64,
+)
+class _UniffiForeignFutureStructI64(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_int64),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_I64 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructI64,
+)
+class _UniffiForeignFutureStructF32(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_float),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_F32 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructF32,
+)
+class _UniffiForeignFutureStructF64(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_double),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_F64 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructF64,
+)
+class _UniffiForeignFutureStructPointer(ctypes.Structure):
+    _fields_ = [
+        ("return_value", ctypes.c_void_p),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_POINTER = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructPointer,
+)
+class _UniffiForeignFutureStructRustBuffer(ctypes.Structure):
+    _fields_ = [
+        ("return_value", _UniffiRustBuffer),
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_RUST_BUFFER = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructRustBuffer,
+)
+class _UniffiForeignFutureStructVoid(ctypes.Structure):
+    _fields_ = [
+        ("call_status", _UniffiRustCallStatus),
+    ]
+_UNIFFI_FOREIGN_FUTURE_COMPLETE_VOID = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiForeignFutureStructVoid,
+)
 _UniffiLib.uniffi_romer_fn_clone_romer.argtypes = (
     ctypes.c_void_p,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -553,7 +639,7 @@ _UniffiLib.uniffi_romer_fn_method_romer_status.argtypes = (
 )
 _UniffiLib.uniffi_romer_fn_method_romer_status.restype = _UniffiRustBuffer
 _UniffiLib.ffi_romer_rustbuffer_alloc.argtypes = (
-    ctypes.c_int32,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rustbuffer_alloc.restype = _UniffiRustBuffer
@@ -569,254 +655,254 @@ _UniffiLib.ffi_romer_rustbuffer_free.argtypes = (
 _UniffiLib.ffi_romer_rustbuffer_free.restype = None
 _UniffiLib.ffi_romer_rustbuffer_reserve.argtypes = (
     _UniffiRustBuffer,
-    ctypes.c_int32,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rustbuffer_reserve.restype = _UniffiRustBuffer
 _UniffiLib.ffi_romer_rust_future_poll_u8.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_u8.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_u8.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_u8.restype = None
 _UniffiLib.ffi_romer_rust_future_free_u8.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_u8.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_u8.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_u8.restype = ctypes.c_uint8
 _UniffiLib.ffi_romer_rust_future_poll_i8.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_i8.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_i8.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_i8.restype = None
 _UniffiLib.ffi_romer_rust_future_free_i8.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_i8.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_i8.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_i8.restype = ctypes.c_int8
 _UniffiLib.ffi_romer_rust_future_poll_u16.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_u16.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_u16.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_u16.restype = None
 _UniffiLib.ffi_romer_rust_future_free_u16.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_u16.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_u16.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_u16.restype = ctypes.c_uint16
 _UniffiLib.ffi_romer_rust_future_poll_i16.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_i16.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_i16.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_i16.restype = None
 _UniffiLib.ffi_romer_rust_future_free_i16.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_i16.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_i16.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_i16.restype = ctypes.c_int16
 _UniffiLib.ffi_romer_rust_future_poll_u32.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_u32.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_u32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_u32.restype = None
 _UniffiLib.ffi_romer_rust_future_free_u32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_u32.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_u32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_u32.restype = ctypes.c_uint32
 _UniffiLib.ffi_romer_rust_future_poll_i32.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_i32.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_i32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_i32.restype = None
 _UniffiLib.ffi_romer_rust_future_free_i32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_i32.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_i32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_i32.restype = ctypes.c_int32
 _UniffiLib.ffi_romer_rust_future_poll_u64.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_u64.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_u64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_u64.restype = None
 _UniffiLib.ffi_romer_rust_future_free_u64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_u64.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_u64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_u64.restype = ctypes.c_uint64
 _UniffiLib.ffi_romer_rust_future_poll_i64.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_i64.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_i64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_i64.restype = None
 _UniffiLib.ffi_romer_rust_future_free_i64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_i64.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_i64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_i64.restype = ctypes.c_int64
 _UniffiLib.ffi_romer_rust_future_poll_f32.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_f32.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_f32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_f32.restype = None
 _UniffiLib.ffi_romer_rust_future_free_f32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_f32.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_f32.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_f32.restype = ctypes.c_float
 _UniffiLib.ffi_romer_rust_future_poll_f64.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_f64.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_f64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_f64.restype = None
 _UniffiLib.ffi_romer_rust_future_free_f64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_f64.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_f64.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_f64.restype = ctypes.c_double
 _UniffiLib.ffi_romer_rust_future_poll_pointer.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_pointer.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_pointer.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_pointer.restype = None
 _UniffiLib.ffi_romer_rust_future_free_pointer.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_pointer.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_pointer.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_pointer.restype = ctypes.c_void_p
 _UniffiLib.ffi_romer_rust_future_poll_rust_buffer.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_rust_buffer.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_rust_buffer.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_rust_buffer.restype = None
 _UniffiLib.ffi_romer_rust_future_free_rust_buffer.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_rust_buffer.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_rust_buffer.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_rust_buffer.restype = _UniffiRustBuffer
 _UniffiLib.ffi_romer_rust_future_poll_void.argtypes = (
-    ctypes.c_void_p,
-    _UNIFFI_FUTURE_CONTINUATION_T,
-    ctypes.c_size_t,
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_poll_void.restype = None
 _UniffiLib.ffi_romer_rust_future_cancel_void.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_cancel_void.restype = None
 _UniffiLib.ffi_romer_rust_future_free_void.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
 )
 _UniffiLib.ffi_romer_rust_future_free_void.restype = None
 _UniffiLib.ffi_romer_rust_future_complete_void.argtypes = (
-    ctypes.c_void_p,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_romer_rust_future_complete_void.restype = None
@@ -847,10 +933,9 @@ _UniffiLib.uniffi_romer_checksum_constructor_romer_new.restype = ctypes.c_uint16
 _UniffiLib.ffi_romer_uniffi_contract_version.argtypes = (
 )
 _UniffiLib.ffi_romer_uniffi_contract_version.restype = ctypes.c_uint32
+
 _uniffi_check_contract_api_version(_UniffiLib)
 _uniffi_check_api_checksums(_UniffiLib)
-
-# Async support
 
 # Public interface members begin here.
 
@@ -952,23 +1037,23 @@ class RomerProtocol(typing.Protocol):
     def status(self, ):
         raise NotImplementedError
 
-class Romer:
 
+class Romer:
     _pointer: ctypes.c_void_p
     def __init__(self, api_token: "str"):
         _UniffiConverterString.check_lower(api_token)
         
-        self._pointer = _rust_call_with_error(_UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_constructor_romer_new,
+        self._pointer = _uniffi_rust_call_with_error(_UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_constructor_romer_new,
         _UniffiConverterString.lower(api_token))
 
     def __del__(self):
         # In case of partial initialization of instances.
         pointer = getattr(self, "_pointer", None)
         if pointer is not None:
-            _rust_call(_UniffiLib.uniffi_romer_fn_free_romer, pointer)
+            _uniffi_rust_call(_UniffiLib.uniffi_romer_fn_free_romer, pointer)
 
     def _uniffi_clone_pointer(self):
-        return _rust_call(_UniffiLib.uniffi_romer_fn_clone_romer, self._pointer)
+        return _uniffi_rust_call(_UniffiLib.uniffi_romer_fn_clone_romer, self._pointer)
 
     # Used by alternative constructors or any methods which return this type.
     @classmethod
@@ -982,9 +1067,8 @@ class Romer:
 
     def balance(self, ) -> "Balances":
         return _UniffiConverterTypeBalances.lift(
-            _rust_call(_UniffiLib.uniffi_romer_fn_method_romer_balance,self._uniffi_clone_pointer(),)
+            _uniffi_rust_call(_UniffiLib.uniffi_romer_fn_method_romer_balance,self._uniffi_clone_pointer(),)
         )
-
 
 
 
@@ -994,7 +1078,7 @@ class Romer:
         _UniffiConverterTypeBolt11Invoice.check_lower(invoice)
         
         return _UniffiConverterBool.lift(
-            _rust_call(_UniffiLib.uniffi_romer_fn_method_romer_invoice_paid,self._uniffi_clone_pointer(),
+            _uniffi_rust_call(_UniffiLib.uniffi_romer_fn_method_romer_invoice_paid,self._uniffi_clone_pointer(),
         _UniffiConverterTypeBolt11Invoice.lower(invoice))
         )
 
@@ -1002,12 +1086,10 @@ class Romer:
 
 
 
-
     def list_payments(self, ) -> "typing.List[PaymentDetails]":
         return _UniffiConverterSequenceTypePaymentDetails.lift(
-            _rust_call(_UniffiLib.uniffi_romer_fn_method_romer_list_payments,self._uniffi_clone_pointer(),)
+            _uniffi_rust_call(_UniffiLib.uniffi_romer_fn_method_romer_list_payments,self._uniffi_clone_pointer(),)
         )
-
 
 
 
@@ -1019,12 +1101,10 @@ class Romer:
         _UniffiConverterString.check_lower(description)
         
         return _UniffiConverterTypeBolt11Invoice.lift(
-            _rust_call_with_error(
-    _UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_method_romer_receive,self._uniffi_clone_pointer(),
+            _uniffi_rust_call_with_error(_UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_method_romer_receive,self._uniffi_clone_pointer(),
         _UniffiConverterUInt64.lower(amount_sat),
         _UniffiConverterString.lower(description))
         )
-
 
 
 
@@ -1034,11 +1114,9 @@ class Romer:
         _UniffiConverterString.check_lower(invoice)
         
         return _UniffiConverterUInt64.lift(
-            _rust_call_with_error(
-    _UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_method_romer_send,self._uniffi_clone_pointer(),
+            _uniffi_rust_call_with_error(_UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_method_romer_send,self._uniffi_clone_pointer(),
         _UniffiConverterString.lower(invoice))
         )
-
 
 
 
@@ -1050,8 +1128,7 @@ class Romer:
         _UniffiConverterUInt64.check_lower(amount_sat)
         
         return _UniffiConverterTypeTxid.lift(
-            _rust_call_with_error(
-    _UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_method_romer_send_onchain,self._uniffi_clone_pointer(),
+            _uniffi_rust_call_with_error(_UniffiConverterTypeRomerError,_UniffiLib.uniffi_romer_fn_method_romer_send_onchain,self._uniffi_clone_pointer(),
         _UniffiConverterString.lower(address),
         _UniffiConverterUInt64.lower(amount_sat))
         )
@@ -1060,11 +1137,11 @@ class Romer:
 
 
 
-
     def status(self, ) -> "Status":
         return _UniffiConverterTypeStatus.lift(
-            _rust_call(_UniffiLib.uniffi_romer_fn_method_romer_status,self._uniffi_clone_pointer(),)
+            _uniffi_rust_call(_UniffiLib.uniffi_romer_fn_method_romer_status,self._uniffi_clone_pointer(),)
         )
+
 
 
 
@@ -1106,8 +1183,7 @@ class Balances:
     total_lightning_balance_sats: "int"
     outbound_capacity_lightning_sats: "int"
     inbound_capacity_lightning_sats: "int"
-    @typing.no_type_check
-    def __init__(self, total_onchain_balance_sats: "int", spendable_onchain_balance_sats: "int", total_anchor_channels_reserve_sats: "int", total_lightning_balance_sats: "int", outbound_capacity_lightning_sats: "int", inbound_capacity_lightning_sats: "int"):
+    def __init__(self, *, total_onchain_balance_sats: "int", spendable_onchain_balance_sats: "int", total_anchor_channels_reserve_sats: "int", total_lightning_balance_sats: "int", outbound_capacity_lightning_sats: "int", inbound_capacity_lightning_sats: "int"):
         self.total_onchain_balance_sats = total_onchain_balance_sats
         self.spendable_onchain_balance_sats = spendable_onchain_balance_sats
         self.total_anchor_channels_reserve_sats = total_anchor_channels_reserve_sats
@@ -1167,8 +1243,7 @@ class _UniffiConverterTypeBalances(_UniffiConverterRustBuffer):
 class LspFeeLimits:
     max_total_opening_fee_msat: "typing.Optional[int]"
     max_proportional_opening_fee_ppm_msat: "typing.Optional[int]"
-    @typing.no_type_check
-    def __init__(self, max_total_opening_fee_msat: "typing.Optional[int]", max_proportional_opening_fee_ppm_msat: "typing.Optional[int]"):
+    def __init__(self, *, max_total_opening_fee_msat: "typing.Optional[int]", max_proportional_opening_fee_ppm_msat: "typing.Optional[int]"):
         self.max_total_opening_fee_msat = max_total_opening_fee_msat
         self.max_proportional_opening_fee_ppm_msat = max_proportional_opening_fee_ppm_msat
 
@@ -1208,8 +1283,7 @@ class PaymentDetails:
     direction: "PaymentDirection"
     status: "PaymentStatus"
     latest_update_timestamp: "int"
-    @typing.no_type_check
-    def __init__(self, id: "PaymentId", kind: "PaymentKind", amount_msat: "typing.Optional[int]", direction: "PaymentDirection", status: "PaymentStatus", latest_update_timestamp: "int"):
+    def __init__(self, *, id: "PaymentId", kind: "PaymentKind", amount_msat: "typing.Optional[int]", direction: "PaymentDirection", status: "PaymentStatus", latest_update_timestamp: "int"):
         self.id = id
         self.kind = kind
         self.amount_msat = amount_msat
@@ -1276,8 +1350,7 @@ class Status:
     latest_onchain_wallet_sync_timestamp: "typing.Optional[int]"
     latest_fee_rate_cache_update_timestamp: "typing.Optional[int]"
     latest_rgs_snapshot_timestamp: "typing.Optional[int]"
-    @typing.no_type_check
-    def __init__(self, node_id: "str", connected: "bool", usable_channels: "bool", best_block_height: "int", best_block_hash: "BlockHash", latest_wallet_sync_timestamp: "typing.Optional[int]", latest_onchain_wallet_sync_timestamp: "typing.Optional[int]", latest_fee_rate_cache_update_timestamp: "typing.Optional[int]", latest_rgs_snapshot_timestamp: "typing.Optional[int]"):
+    def __init__(self, *, node_id: "str", connected: "bool", usable_channels: "bool", best_block_height: "int", best_block_hash: "BlockHash", latest_wallet_sync_timestamp: "typing.Optional[int]", latest_onchain_wallet_sync_timestamp: "typing.Optional[int]", latest_fee_rate_cache_update_timestamp: "typing.Optional[int]", latest_rgs_snapshot_timestamp: "typing.Optional[int]"):
         self.node_id = node_id
         self.connected = connected
         self.usable_channels = usable_channels
@@ -1390,6 +1463,7 @@ class _UniffiConverterTypeNetwork(_UniffiConverterRustBuffer):
             return
         if value == Network.REGTEST:
             return
+        raise ValueError(value)
 
     @staticmethod
     def write(value, buf):
@@ -1430,6 +1504,7 @@ class _UniffiConverterTypePaymentDirection(_UniffiConverterRustBuffer):
             return
         if value == PaymentDirection.OUTBOUND:
             return
+        raise ValueError(value)
 
     @staticmethod
     def write(value, buf):
@@ -1450,11 +1525,8 @@ class PaymentKind:
     # Each enum variant is a nested class of the enum itself.
     class ONCHAIN:
 
-        @typing.no_type_check
         def __init__(self,):
-            
             pass
-            
 
         def __str__(self):
             return "PaymentKind.ONCHAIN()".format()
@@ -1463,18 +1535,16 @@ class PaymentKind:
             if not other.is_onchain():
                 return False
             return True
+    
     class BOLT11:
         hash: "PaymentHash"
         preimage: "typing.Optional[PaymentPreimage]"
         secret: "typing.Optional[PaymentSecret]"
 
-        @typing.no_type_check
         def __init__(self,hash: "PaymentHash", preimage: "typing.Optional[PaymentPreimage]", secret: "typing.Optional[PaymentSecret]"):
-            
             self.hash = hash
             self.preimage = preimage
             self.secret = secret
-            
 
         def __str__(self):
             return "PaymentKind.BOLT11(hash={}, preimage={}, secret={})".format(self.hash, self.preimage, self.secret)
@@ -1489,20 +1559,18 @@ class PaymentKind:
             if self.secret != other.secret:
                 return False
             return True
+    
     class BOLT11_JIT:
         hash: "PaymentHash"
         preimage: "typing.Optional[PaymentPreimage]"
         secret: "typing.Optional[PaymentSecret]"
         lsp_fee_limits: "LspFeeLimits"
 
-        @typing.no_type_check
         def __init__(self,hash: "PaymentHash", preimage: "typing.Optional[PaymentPreimage]", secret: "typing.Optional[PaymentSecret]", lsp_fee_limits: "LspFeeLimits"):
-            
             self.hash = hash
             self.preimage = preimage
             self.secret = secret
             self.lsp_fee_limits = lsp_fee_limits
-            
 
         def __str__(self):
             return "PaymentKind.BOLT11_JIT(hash={}, preimage={}, secret={}, lsp_fee_limits={})".format(self.hash, self.preimage, self.secret, self.lsp_fee_limits)
@@ -1519,20 +1587,18 @@ class PaymentKind:
             if self.lsp_fee_limits != other.lsp_fee_limits:
                 return False
             return True
+    
     class BOLT12_OFFER:
         hash: "typing.Optional[PaymentHash]"
         preimage: "typing.Optional[PaymentPreimage]"
         secret: "typing.Optional[PaymentSecret]"
         offer_id: "OfferId"
 
-        @typing.no_type_check
         def __init__(self,hash: "typing.Optional[PaymentHash]", preimage: "typing.Optional[PaymentPreimage]", secret: "typing.Optional[PaymentSecret]", offer_id: "OfferId"):
-            
             self.hash = hash
             self.preimage = preimage
             self.secret = secret
             self.offer_id = offer_id
-            
 
         def __str__(self):
             return "PaymentKind.BOLT12_OFFER(hash={}, preimage={}, secret={}, offer_id={})".format(self.hash, self.preimage, self.secret, self.offer_id)
@@ -1549,18 +1615,16 @@ class PaymentKind:
             if self.offer_id != other.offer_id:
                 return False
             return True
+    
     class BOLT12_REFUND:
         hash: "typing.Optional[PaymentHash]"
         preimage: "typing.Optional[PaymentPreimage]"
         secret: "typing.Optional[PaymentSecret]"
 
-        @typing.no_type_check
         def __init__(self,hash: "typing.Optional[PaymentHash]", preimage: "typing.Optional[PaymentPreimage]", secret: "typing.Optional[PaymentSecret]"):
-            
             self.hash = hash
             self.preimage = preimage
             self.secret = secret
-            
 
         def __str__(self):
             return "PaymentKind.BOLT12_REFUND(hash={}, preimage={}, secret={})".format(self.hash, self.preimage, self.secret)
@@ -1575,16 +1639,14 @@ class PaymentKind:
             if self.secret != other.secret:
                 return False
             return True
+    
     class SPONTANEOUS:
         hash: "PaymentHash"
         preimage: "typing.Optional[PaymentPreimage]"
 
-        @typing.no_type_check
         def __init__(self,hash: "PaymentHash", preimage: "typing.Optional[PaymentPreimage]"):
-            
             self.hash = hash
             self.preimage = preimage
-            
 
         def __str__(self):
             return "PaymentKind.SPONTANEOUS(hash={}, preimage={})".format(self.hash, self.preimage)
@@ -1597,6 +1659,7 @@ class PaymentKind:
             if self.preimage != other.preimage:
                 return False
             return True
+    
     
 
     # For each variant, we have an `is_NAME` method for easily checking
@@ -1698,6 +1761,7 @@ class _UniffiConverterTypePaymentKind(_UniffiConverterRustBuffer):
             _UniffiConverterTypePaymentHash.check_lower(value.hash)
             _UniffiConverterOptionalTypePaymentPreimage.check_lower(value.preimage)
             return
+        raise ValueError(value)
 
     @staticmethod
     def write(value, buf):
@@ -1764,6 +1828,7 @@ class _UniffiConverterTypePaymentStatus(_UniffiConverterRustBuffer):
             return
         if value == PaymentStatus.FAILED:
             return
+        raise ValueError(value)
 
     @staticmethod
     def write(value, buf):
@@ -2147,9 +2212,6 @@ class _UniffiConverterSequenceTypePaymentDetails(_UniffiConverterRustBuffer):
         ]
 
 
-# Type alias
-Address = str
-
 class _UniffiConverterTypeAddress:
     @staticmethod
     def write(value, buf):
@@ -2171,9 +2233,6 @@ class _UniffiConverterTypeAddress:
     def lower(value):
         return _UniffiConverterString.lower(value)
 
-
-# Type alias
-BlockHash = str
 
 class _UniffiConverterTypeBlockHash:
     @staticmethod
@@ -2197,9 +2256,6 @@ class _UniffiConverterTypeBlockHash:
         return _UniffiConverterString.lower(value)
 
 
-# Type alias
-Bolt11Invoice = str
-
 class _UniffiConverterTypeBolt11Invoice:
     @staticmethod
     def write(value, buf):
@@ -2221,9 +2277,6 @@ class _UniffiConverterTypeBolt11Invoice:
     def lower(value):
         return _UniffiConverterString.lower(value)
 
-
-# Type alias
-OfferId = str
 
 class _UniffiConverterTypeOfferId:
     @staticmethod
@@ -2247,9 +2300,6 @@ class _UniffiConverterTypeOfferId:
         return _UniffiConverterString.lower(value)
 
 
-# Type alias
-PaymentHash = str
-
 class _UniffiConverterTypePaymentHash:
     @staticmethod
     def write(value, buf):
@@ -2271,9 +2321,6 @@ class _UniffiConverterTypePaymentHash:
     def lower(value):
         return _UniffiConverterString.lower(value)
 
-
-# Type alias
-PaymentId = str
 
 class _UniffiConverterTypePaymentId:
     @staticmethod
@@ -2297,9 +2344,6 @@ class _UniffiConverterTypePaymentId:
         return _UniffiConverterString.lower(value)
 
 
-# Type alias
-PaymentPreimage = str
-
 class _UniffiConverterTypePaymentPreimage:
     @staticmethod
     def write(value, buf):
@@ -2321,9 +2365,6 @@ class _UniffiConverterTypePaymentPreimage:
     def lower(value):
         return _UniffiConverterString.lower(value)
 
-
-# Type alias
-PaymentSecret = str
 
 class _UniffiConverterTypePaymentSecret:
     @staticmethod
@@ -2347,9 +2388,6 @@ class _UniffiConverterTypePaymentSecret:
         return _UniffiConverterString.lower(value)
 
 
-# Type alias
-Txid = str
-
 class _UniffiConverterTypeTxid:
     @staticmethod
     def write(value, buf):
@@ -2370,6 +2408,17 @@ class _UniffiConverterTypeTxid:
     @staticmethod
     def lower(value):
         return _UniffiConverterString.lower(value)
+Address = str
+BlockHash = str
+Bolt11Invoice = str
+OfferId = str
+PaymentHash = str
+PaymentId = str
+PaymentPreimage = str
+PaymentSecret = str
+Txid = str
+
+# Async support
 
 __all__ = [
     "InternalError",

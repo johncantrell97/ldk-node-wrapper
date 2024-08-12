@@ -1,0 +1,15 @@
+Metadata-Version: 2.1
+Name: romer
+Version: 0.1.0
+Summary: A ready-to-go lightning payments solution.
+Author-email: John Cantrell <johncantrell@squareup.com>
+Project-URL: Homepage, https://cequals.xyz/
+Project-URL: Github, https://github.com/cequals/romer-sdk
+Project-URL: Bug Tracker, https://github.com/cequals/romer-sdk/issues
+Classifier: Topic :: Software Development :: Libraries
+Classifier: Topic :: Security :: Cryptography
+Classifier: License :: OSI Approved :: MIT License
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
